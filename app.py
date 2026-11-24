@@ -1,5 +1,5 @@
 import calendar
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 import re
 from typing import Any
@@ -15,7 +15,8 @@ WORKBOOK_PATH = Path(__file__).with_name("Simulador_HC_Escala_5x2.xlsx")
 ACTIVE_SHEET = "Ativos"
 ASSUMPTIONS_SHEET = "Premissas"
 WEEKDAYS = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
-OFF_DAY_PAIRS = ((6, 0), (0, 1), (1, 2), (2, 3), (3, 4))
+OFF_DAY_PAIRS = ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5))
+SUNDAY_EPOCH = date(2000, 1, 2)
 MONTHS = (
     "janeiro",
     "fevereiro",
@@ -177,6 +178,10 @@ def is_leadership_role(role: str) -> bool:
     )
 
 
+def sunday_week_start(day: date) -> date:
+    return day - timedelta(days=(day.weekday() + 1) % 7)
+
+
 def allocate_weekly_days_off(
     employees: list[dict[str, str]],
     leadership_ids: set[int],
@@ -200,7 +205,7 @@ def allocate_weekly_days_off(
     for employee_index, employee in enumerate(ordered_employees):
         employee_id = id(employee)
         if employee_id == sunday_off_leader_id:
-            candidate_pairs = ((6, 0),)
+            candidate_pairs = ((0, 1),)
         elif employee_id in leadership_ids:
             candidate_pairs = OFF_DAY_PAIRS[1:]
         else:
@@ -213,7 +218,7 @@ def allocate_weekly_days_off(
                 updated_days_off[weekday] += 1
             coverage_shortfall = sum(
                 max(0, 2 - (shift_headcount - updated_days_off[weekday])) ** 2
-                for weekday in range(4)
+                for weekday in range(1, 5)
             )
             day_imbalance = sum(
                 (
@@ -221,7 +226,7 @@ def allocate_weekly_days_off(
                     - 2 * shift_headcount
                 )
                 ** 2
-                for weekday in (0, 1, 2, 3, 4, 6)
+                for weekday in range(6)
             )
             tie_breaker = (
                 pair_index - week_index - employee_index
@@ -336,15 +341,18 @@ def build_month_schedule(
             "não é possível garantir cobertura aos domingos."
         )
 
-    calendar_weeks = calendar.monthcalendar(year, month)
-    day_week_indexes = {
-        day: week_index
-        for week_index, calendar_week in enumerate(calendar_weeks)
-        for day in calendar_week
-        if day
-    }
-    weekly_off_pairs: dict[tuple[int, int], tuple[int, int]] = {}
-    for week_index in range(len(calendar_weeks)):
+    month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
+    first_week_start = sunday_week_start(month_start)
+    last_week_start = sunday_week_start(month_end)
+    week_starts = []
+    week_start = first_week_start
+    while week_start <= last_week_start:
+        week_starts.append(week_start)
+        week_start += timedelta(days=7)
+    weekly_off_dates: dict[tuple[int, int], set[date]] = {}
+    for week_start in week_starts:
+        week_index = (week_start - SUNDAY_EPOCH).days // 7
         sunday_off_leader_id = None
         if len(leadership_employees) > 1:
             sunday_off_leader_id = id(
@@ -358,7 +366,39 @@ def build_month_schedule(
                 week_index,
             )
             for employee_id, off_pair in week_assignments.items():
-                weekly_off_pairs[(employee_id, week_index)] = off_pair
+                weekly_off_dates[(employee_id, week_index)] = {
+                    week_start + timedelta(days=weekday) for weekday in off_pair
+                }
+    invalid_off_weeks = []
+    for week_start in week_starts:
+        week_index = (week_start - SUNDAY_EPOCH).days // 7
+        for employee in interleaved_employees:
+            off_dates = sorted(
+                weekly_off_dates[(id(employee), week_index)]
+            )
+            if (
+                len(off_dates) != 2
+                or (off_dates[1] - off_dates[0]).days != 1
+                or any((day - week_start).days == 6 for day in off_dates)
+            ):
+                invalid_off_weeks.append(week_start)
+                break
+    if invalid_off_weeks:
+        week_labels = ", ".join(
+            week_start.strftime("%d/%m/%Y")
+            for week_start in sorted(set(invalid_off_weeks))
+        )
+        exceptions.append(
+            "Falha na validação 5x2: revise a distribuição de 2 folgas "
+            f"consecutivas (sem sábado) nas semanas iniciadas em {week_labels}."
+        )
+    week_index_by_day = {
+        day: (
+            sunday_week_start(date(year, month, day)) - SUNDAY_EPOCH
+        ).days
+        // 7
+        for day in range(1, days_in_month + 1)
+    }
 
     role_shift_counts: dict[str, dict[str, int]] = {}
     employee_rows: list[dict[str, Any]] = []
@@ -381,9 +421,10 @@ def build_month_schedule(
         }
         for day in range(1, days_in_month + 1):
             weekday = calendar.weekday(year, month, day)
-            week_index = day_week_indexes[day]
-            off_pair = weekly_off_pairs[(id(employee), week_index)]
-            on_leave = weekday in off_pair
+            week_index = week_index_by_day[day]
+            on_leave = date(year, month, day) in weekly_off_dates[
+                (id(employee), week_index)
+            ]
             row[day_columns[day - 1]] = "F" if on_leave else shift
             if not on_leave:
                 coverage[f"{shift} · {'manhã' if shift == 'T1' else 'tarde'}"][day - 1] += 1
@@ -598,6 +639,14 @@ def main() -> None:
 
     for exception in role_exceptions:
         st.warning(exception)
+    if not any(
+        exception.startswith("Falha na validação 5x2")
+        for exception in role_exceptions
+    ):
+        st.success(
+            "Validação 5x2 aprovada: 2 folgas consecutivas por pessoa "
+            "em cada semana (domingo a sábado), sem folga aos sábados."
+        )
 
     st.markdown("**Ativos por cargo e turno**")
     role_styler = role_summary.style.set_properties(
@@ -622,7 +671,8 @@ def main() -> None:
         "colaboradores no T2 (tarde), reforçando o período de maior fluxo, e "
         "busca manter ao menos 2 pessoas por turno de segunda a quinta. "
         "Quando o HC não permite atingir esse mínimo, os dias são sinalizados. "
-        "As folgas são em pares consecutivos; ninguém folga aos sábados. "
+        "Cada semana (domingo a sábado) atribui 2 folgas consecutivas; "
+        "ninguém folga aos sábados. "
         "Quando há mais de uma liderança ativa, as folgas de domingo se "
         "alternam entre elas para manter cobertura."
     )
@@ -739,4 +789,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from aggregate_app import main as aggregate_main
+
+    aggregate_main()
